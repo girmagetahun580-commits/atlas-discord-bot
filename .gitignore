@@ -1,3 +1,4 @@
 node_modules/
 .env
 conversation-history.json
+data/
