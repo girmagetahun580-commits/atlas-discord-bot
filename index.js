@@ -8,6 +8,7 @@ import { Readable } from 'stream';
 import { SYSTEM_PROMPT, VOICE_GREETING } from './system-prompt.js';
 import { getHistory, addMessage } from './memory.js';
 import { startHealthServer, markOnline, markActivity } from './health.js';
+import { detectIntent, fetchDataForIntents } from './data-middleware.js';
 
 const DISCORD_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const GROQ_KEY = process.env.GROQ_API_KEY;
@@ -71,6 +72,8 @@ async function chatWithLLM(history, userMessage, systemOverride = null) {
   throw new Error('All retries exhausted');
 }
 
+// --- Data-aware message handler ---
+
 discord.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (message.channel.name !== TEXT_CHANNEL) return;
@@ -78,7 +81,21 @@ discord.on(Events.MessageCreate, async (message) => {
   const history = getHistory(message.channel.id);
   try {
     await message.channel.sendTyping();
-    const reply = await chatWithLLM(history, message.content);
+
+    // Detect intent and fetch live data from Airtable
+    const { intents, extractedParams } = detectIntent(message.content);
+    let dataContext = '';
+    if (intents.length > 0) {
+      dataContext = await fetchDataForIntents(intents, extractedParams);
+    }
+
+    // Inject live data into the system prompt
+    let systemPrompt = SYSTEM_PROMPT;
+    if (dataContext) {
+      systemPrompt += '\n\n' + dataContext + '\n\nUse the LIVE CONTEXT DATA above to answer the user accurately. Present the data conversationally \u2014 do not say "according to the data" or reference the data source. Just answer naturally as if you know this information.';
+    }
+
+    const reply = await chatWithLLM(history, message.content, systemPrompt);
     addMessage(message.channel.id, 'user', message.content);
     addMessage(message.channel.id, 'assistant', reply);
     if (reply.length > 2000) {
@@ -176,7 +193,19 @@ async function voiceConversationLoop(connection, userId, guildId) {
         connection.destroy();
         return;
       }
-      const voicePrompt = SYSTEM_PROMPT + '\n\nVOICE MODE. Keep responses under 3 sentences. No markdown.';
+
+      // Detect intent and fetch live data for voice too
+      const { intents, extractedParams } = detectIntent(transcript);
+      let dataContext = '';
+      if (intents.length > 0) {
+        dataContext = await fetchDataForIntents(intents, extractedParams);
+      }
+
+      let voicePrompt = SYSTEM_PROMPT + '\n\nVOICE MODE. Keep responses under 3 sentences. No markdown.';
+      if (dataContext) {
+        voicePrompt += '\n\n' + dataContext + '\n\nUse the LIVE CONTEXT DATA above to answer accurately. Be brief and conversational.';
+      }
+
       const reply = await chatWithLLM(history, transcript, voicePrompt);
       addMessage(`voice-${guildId}`, 'user', transcript);
       addMessage(`voice-${guildId}`, 'assistant', reply);
@@ -222,12 +251,13 @@ discord.once(Events.ClientReady, async (client) => {
   console.log(`   LLM: Groq (${GROQ_MODEL})`);
   console.log(`   Listening for text in #${TEXT_CHANNEL}`);
   console.log(`   Listening for voice in \ud83d\udd0a ${VOICE_CHANNEL}`);
+  console.log(`   Data: Airtable via local API middleware`);
   markOnline();
   try {
     const guild = client.guilds.cache.first();
     if (guild) {
       const statusCh = guild.channels.cache.find(c => c.name === STATUS_CHANNEL);
-      if (statusCh) await statusCh.send(`\u2705 **Atlas is online** (${new Date().toISOString()})\nLLM: Groq ${GROQ_MODEL}`);
+      if (statusCh) await statusCh.send(`\u2705 **Atlas is online** (${new Date().toISOString()})\nLLM: Groq ${GROQ_MODEL}\nData: Airtable (unified sync)`);
     }
   } catch { }
 });
