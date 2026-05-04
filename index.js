@@ -20,12 +20,42 @@ const VOICE_CHANNEL = process.env.VOICE_CHANNEL_NAME || 'Atlas Voice';
 const TEXT_CHANNEL = process.env.TEXT_CHANNEL_NAME || 'atlas';
 const STATUS_CHANNEL = process.env.STATUS_CHANNEL_NAME || 'bot-status';
 
+// Discord voice message flag (1 << 13)
+const IS_VOICE_MESSAGE = 1 << 13;
+
 const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates,
   ],
 });
+
+// --- Transcribe Discord voice messages (OGG/Opus format) ---
+
+async function transcribeVoiceNote(audioUrl) {
+  // Download the audio file from Discord CDN
+  const audioRes = await fetch(audioUrl);
+  if (!audioRes.ok) throw new Error(`Failed to download voice note: ${audioRes.status}`);
+  const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
+
+  // Send to Deepgram with OGG content type
+  const response = await fetch(
+    'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language=en',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Token ${DEEPGRAM_KEY}`,
+        'Content-Type': 'audio/ogg',
+      },
+      body: audioBuffer,
+    }
+  );
+  if (!response.ok) throw new Error(`Deepgram STT error: ${response.status}`);
+  const result = await response.json();
+  return result.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
+}
+
+// --- LLM call with retry logic ---
 
 async function chatWithLLM(history, userMessage, systemOverride = null) {
   const messages = [
@@ -72,7 +102,7 @@ async function chatWithLLM(history, userMessage, systemOverride = null) {
   throw new Error('All retries exhausted');
 }
 
-// --- Data-aware message handler ---
+// --- Data-aware message handler (text + voice notes) ---
 
 discord.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
@@ -82,8 +112,47 @@ discord.on(Events.MessageCreate, async (message) => {
   try {
     await message.channel.sendTyping();
 
+    // Determine the user's message content
+    let userText = message.content || '';
+    let isVoiceNote = false;
+
+    // Check for Discord voice message
+    const isVoiceMsg = (message.flags?.bitfield & IS_VOICE_MESSAGE) !== 0;
+    const audioAttachment = message.attachments?.find(a =>
+      a.contentType?.startsWith('audio/') ||
+      a.url?.endsWith('.ogg') ||
+      a.name?.endsWith('.ogg')
+    );
+
+    if (isVoiceMsg && audioAttachment) {
+      isVoiceNote = true;
+      console.log(`Voice note received from ${message.author.username} (${audioAttachment.size} bytes)`);
+
+      if (!DEEPGRAM_KEY) {
+        await message.reply("I can't process voice notes yet \u2014 Deepgram API key isn't configured.");
+        return;
+      }
+
+      // Transcribe the voice message
+      const transcript = await transcribeVoiceNote(audioAttachment.url);
+      if (!transcript || transcript.trim().length === 0) {
+        await message.reply("I couldn't make out what you said. Could you try again or type it out?");
+        return;
+      }
+
+      userText = transcript;
+      console.log(`Transcribed voice note: "${transcript}"`);
+
+      // Show the transcription so user knows what Atlas heard
+      await message.reply(`\ud83c\udfa4 *"${transcript}"*`);
+      await message.channel.sendTyping();
+    }
+
+    // If no text and no voice note, skip
+    if (!userText.trim()) return;
+
     // Detect intent and fetch live data from Airtable
-    const { intents, extractedParams } = detectIntent(message.content);
+    const { intents, extractedParams } = detectIntent(userText);
     let dataContext = '';
     if (intents.length > 0) {
       dataContext = await fetchDataForIntents(intents, extractedParams);
@@ -95,8 +164,8 @@ discord.on(Events.MessageCreate, async (message) => {
       systemPrompt += '\n\n' + dataContext + '\n\nUse the LIVE CONTEXT DATA above to answer the user accurately. Present the data conversationally \u2014 do not say "according to the data" or reference the data source. Just answer naturally as if you know this information.';
     }
 
-    const reply = await chatWithLLM(history, message.content, systemPrompt);
-    addMessage(message.channel.id, 'user', message.content);
+    const reply = await chatWithLLM(history, userText, systemPrompt);
+    addMessage(message.channel.id, 'user', userText);
     addMessage(message.channel.id, 'assistant', reply);
     if (reply.length > 2000) {
       const chunks = reply.match(/[\s\S]{1,1990}/g);
@@ -194,7 +263,6 @@ async function voiceConversationLoop(connection, userId, guildId) {
         return;
       }
 
-      // Detect intent and fetch live data for voice too
       const { intents, extractedParams } = detectIntent(transcript);
       let dataContext = '';
       if (intents.length > 0) {
@@ -251,13 +319,14 @@ discord.once(Events.ClientReady, async (client) => {
   console.log(`   LLM: Groq (${GROQ_MODEL})`);
   console.log(`   Listening for text in #${TEXT_CHANNEL}`);
   console.log(`   Listening for voice in \ud83d\udd0a ${VOICE_CHANNEL}`);
+  console.log(`   Voice notes: enabled (Deepgram transcription)`);
   console.log(`   Data: Airtable via local API middleware`);
   markOnline();
   try {
     const guild = client.guilds.cache.first();
     if (guild) {
       const statusCh = guild.channels.cache.find(c => c.name === STATUS_CHANNEL);
-      if (statusCh) await statusCh.send(`\u2705 **Atlas is online** (${new Date().toISOString()})\nLLM: Groq ${GROQ_MODEL}\nData: Airtable (unified sync)`);
+      if (statusCh) await statusCh.send(`\u2705 **Atlas is online** (${new Date().toISOString()})\nLLM: Groq ${GROQ_MODEL}\nData: Airtable (unified sync)\nVoice notes: enabled`);
     }
   } catch { }
 });
