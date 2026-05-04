@@ -1,58 +1,45 @@
-// Atlas API — Server Tools for ElevenLabs ConvAI
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+// Atlas API — Airtable Backend (replaces local JSON storage)
+// All data now reads/writes from shared Airtable base
 import { isGoogleConfigured, getCalendarEvents, getEmails, getEmailStats, getAuthUrl, exchangeCodeForTokens } from './google.js';
 
-const DATA_DIR = './data';
 const API_KEY = process.env.API_SECRET_KEY || 'atlas-default-key';
+const AIRTABLE_PAT = process.env.AIRTABLE_PAT;
+const AIRTABLE_BASE_ID = 'appinEEtxuzaHbI6J';
+const AIRTABLE_API = `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}`;
 
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR);
+// --- Airtable helpers ---
 
-function loadJSON(file) {
-  const path = `${DATA_DIR}/${file}`;
-  if (!existsSync(path)) return [];
-  return JSON.parse(readFileSync(path, 'utf-8'));
+async function airtableFetch(path, options = {}) {
+  if (!AIRTABLE_PAT) throw new Error('AIRTABLE_PAT not set');
+  const res = await fetch(`${AIRTABLE_API}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${AIRTABLE_PAT}`,
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Airtable ${res.status}: ${body}`);
+  }
+  return res.json();
 }
 
-function saveJSON(file, data) {
-  writeFileSync(`${DATA_DIR}/${file}`, JSON.stringify(data, null, 2));
+async function listRecords(table, params = {}) {
+  const records = [];
+  let offset;
+  do {
+    const qs = new URLSearchParams(params);
+    if (offset) qs.set('offset', offset);
+    const data = await airtableFetch(`/${encodeURIComponent(table)}?${qs}`);
+    records.push(...data.records);
+    offset = data.offset;
+  } while (offset);
+  return records;
 }
 
-function initData() {
-  if (!existsSync(`${DATA_DIR}/tasks.json`)) {
-    saveJSON('tasks.json', [
-      { id: 1, name: "Set up Airtable connection", status: "todo", priority: 4, due_date: "2026-05-01", project: "Atlas Setup" },
-      { id: 2, name: "Connect Gmail & Google Calendar", status: "todo", priority: 5, due_date: "2026-05-01", project: "Atlas Setup" },
-      { id: 3, name: "Update bill amounts", status: "todo", priority: 4, due_date: "2026-05-02", project: "Atlas Setup" },
-    ]);
-  }
-  if (!existsSync(`${DATA_DIR}/habits.json`)) {
-    saveJSON('habits.json', [
-      { id: 1, name: "Morning Workout", window: "morning", streak: 0, todayDone: false },
-      { id: 2, name: "Read 30 Minutes", window: "evening", streak: 0, todayDone: false },
-      { id: 3, name: "Meditate 10 Minutes", window: "morning", streak: 0, todayDone: false },
-      { id: 4, name: "Drink 8 Glasses of Water", window: "anytime", streak: 0, todayDone: false },
-      { id: 5, name: "Journal Entry", window: "evening", streak: 0, todayDone: false },
-      { id: 6, name: "No Phone Before Bed", window: "evening", streak: 0, todayDone: false },
-    ]);
-  }
-  if (!existsSync(`${DATA_DIR}/finance.json`)) {
-    saveJSON('finance.json', [
-      { id: 1, vendor: "Rent / Mortgage", amount: 0, category: "housing", recurring: true, due_day: 1 },
-      { id: 2, vendor: "Netflix", amount: 15.99, category: "subscriptions", recurring: true, due_day: 5 },
-      { id: 3, vendor: "Spotify", amount: 10.99, category: "subscriptions", recurring: true, due_day: 5 },
-      { id: 4, vendor: "Internet", amount: 0, category: "utilities", recurring: true, due_day: 10 },
-      { id: 5, vendor: "Electric Bill", amount: 0, category: "utilities", recurring: true, due_day: 15 },
-      { id: 6, vendor: "Car Insurance", amount: 0, category: "transport", recurring: true, due_day: 15 },
-      { id: 7, vendor: "Phone Bill", amount: 0, category: "utilities", recurring: true, due_day: 20 },
-      { id: 8, vendor: "Gym Membership", amount: 0, category: "health", recurring: true, due_day: 1 },
-    ]);
-  }
-  if (!existsSync(`${DATA_DIR}/expenses.json`)) {
-    saveJSON('expenses.json', []);
-  }
-}
-
-initData();
+// --- Auth & body parsing (unchanged) ---
 
 function checkAuth(req, res) {
   const auth = req.headers.authorization;
@@ -75,6 +62,8 @@ function parseBody(req) {
   });
 }
 
+// --- Weather (unchanged — uses wttr.in) ---
+
 async function getWeather() {
   try {
     const res = await fetch('https://wttr.in/Jinka+Ethiopia?format=j1');
@@ -93,11 +82,14 @@ async function getWeather() {
   }
 }
 
+// --- Main request handler ---
+
 export async function handleAPIRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const path = url.pathname;
   const method = req.method;
 
+  // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -114,131 +106,249 @@ export async function handleAPIRequest(req, res) {
     res.end(JSON.stringify(data));
   };
 
+  // ============ TASKS (Airtable) ============
+
   if (path === '/api/tasks' && method === 'GET') {
-    const tasks = loadJSON('tasks.json');
-    const active = tasks.filter(t => t.status !== 'done').sort((a, b) => b.priority - a.priority);
-    json({ tasks: active, total: tasks.length, active: active.length });
+    try {
+      const records = await listRecords('Tasks', {
+        filterByFormula: "NOT({status} = 'done')",
+        'sort[0][field]': 'priority',
+        'sort[0][direction]': 'desc',
+      });
+      const tasks = records.map(r => ({
+        id: r.id,
+        name: r.fields.name,
+        status: r.fields.status || 'todo',
+        priority: r.fields.priority || 3,
+        due_date: r.fields.due_date || null,
+        project: r.fields.project || '',
+      }));
+      json({ tasks, total: tasks.length, active: tasks.length });
+    } catch (err) {
+      json({ error: 'Failed to fetch tasks', details: err.message }, 500);
+    }
     return true;
   }
 
   if (path === '/api/tasks' && method === 'POST') {
     const body = await parseBody(req);
-    const tasks = loadJSON('tasks.json');
-    const newTask = {
-      id: tasks.length + 1, name: body.name || 'Untitled task',
-      status: 'todo', priority: body.priority || 3,
-      due_date: body.due_date || null, project: body.project || 'General',
-      created: new Date().toISOString(),
-    };
-    tasks.push(newTask);
-    saveJSON('tasks.json', tasks);
-    json({ message: `Task added: "${newTask.name}"`, task: newTask });
+    try {
+      const fields = {
+        name: body.name || 'Untitled task',
+        status: 'todo',
+        priority: body.priority || 3,
+        last_touched: new Date().toISOString().slice(0, 10),
+      };
+      if (body.due_date) fields.due_date = body.due_date;
+      if (body.project) fields.project = body.project;
+
+      const data = await airtableFetch(`/${encodeURIComponent('Tasks')}`, {
+        method: 'POST',
+        body: JSON.stringify({ records: [{ fields }], typecast: true }),
+      });
+      const t = data.records[0];
+      json({ message: `Task added: "${t.fields.name}"`, task: t.fields });
+    } catch (err) {
+      json({ error: 'Failed to add task', details: err.message }, 500);
+    }
     return true;
   }
 
   if (path === '/api/tasks/complete' && method === 'POST') {
     const body = await parseBody(req);
-    const tasks = loadJSON('tasks.json');
-    const task = tasks.find(t => t.name.toLowerCase().includes((body.name || '').toLowerCase()) && t.status !== 'done');
-    if (task) {
-      task.status = 'done'; task.completed_at = new Date().toISOString();
-      saveJSON('tasks.json', tasks);
-      json({ message: `Task completed: "${task.name}"` });
-    } else {
-      json({ message: `No active task matching "${body.name}"` }, 404);
+    try {
+      const records = await listRecords('Tasks', {
+        filterByFormula: "NOT({status} = 'done')",
+      });
+      const target = records.find(r =>
+        r.fields.name.toLowerCase().includes((body.name || '').toLowerCase())
+      );
+      if (target) {
+        await airtableFetch(`/${encodeURIComponent('Tasks')}/${target.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            fields: { status: 'done', last_touched: new Date().toISOString().slice(0, 10) },
+            typecast: true,
+          }),
+        });
+        json({ message: `Task completed: "${target.fields.name}"` });
+      } else {
+        json({ message: `No active task matching "${body.name}"` }, 404);
+      }
+    } catch (err) {
+      json({ error: 'Failed to complete task', details: err.message }, 500);
     }
     return true;
   }
 
+  // ============ HABITS (Airtable) ============
+
   if (path === '/api/habits' && method === 'GET') {
-    const habits = loadJSON('habits.json');
-    json({ habits, completed_today: habits.filter(h => h.todayDone).length, total: habits.length });
+    try {
+      const records = await listRecords('Habits');
+      const habits = records.map(r => ({
+        id: r.id,
+        name: r.fields.habit,
+        window: r.fields.target_window || 'anytime',
+        streak: r.fields.streak || 0,
+        todayDone: r.fields.completed || false,
+      }));
+      json({ habits, completed_today: habits.filter(h => h.todayDone).length, total: habits.length });
+    } catch (err) {
+      json({ error: 'Failed to fetch habits', details: err.message }, 500);
+    }
     return true;
   }
 
   if (path === '/api/habits/complete' && method === 'POST') {
     const body = await parseBody(req);
-    const habits = loadJSON('habits.json');
-    const habit = habits.find(h => h.name.toLowerCase().includes((body.name || '').toLowerCase()));
-    if (habit) {
-      habit.todayDone = true; habit.streak += 1;
-      saveJSON('habits.json', habits);
-      json({ message: `"${habit.name}" marked done! Streak: ${habit.streak} days` });
-    } else {
-      json({ message: `No habit matching "${body.name}"` }, 404);
+    try {
+      const records = await listRecords('Habits');
+      const target = records.find(r =>
+        r.fields.habit.toLowerCase().includes((body.name || '').toLowerCase())
+      );
+      if (target) {
+        const newStreak = (target.fields.streak || 0) + 1;
+        await airtableFetch(`/${encodeURIComponent('Habits')}/${target.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({
+            fields: {
+              completed: true,
+              date: new Date().toISOString().slice(0, 10),
+              streak: newStreak,
+            },
+            typecast: true,
+          }),
+        });
+        json({ message: `"${target.fields.habit}" marked done! Streak: ${newStreak} days` });
+      } else {
+        json({ message: `No habit matching "${body.name}"` }, 404);
+      }
+    } catch (err) {
+      json({ error: 'Failed to complete habit', details: err.message }, 500);
     }
     return true;
   }
 
+  // ============ FINANCE (Airtable) ============
+
   if (path === '/api/finance/bills' && method === 'GET') {
-    const bills = loadJSON('finance.json');
-    json({ bills, total_monthly: bills.reduce((s, b) => s + (b.amount || 0), 0) });
+    try {
+      const records = await listRecords('Finance', {
+        filterByFormula: '{recurring} = TRUE()',
+      });
+      const bills = records.map(r => ({
+        id: r.id,
+        vendor: r.fields.vendor,
+        amount: r.fields.amount || 0,
+        category: r.fields.category || 'misc',
+        due_date: r.fields.due_date || null,
+      }));
+      json({ bills, total_monthly: bills.reduce((s, b) => s + b.amount, 0) });
+    } catch (err) {
+      json({ error: 'Failed to fetch bills', details: err.message }, 500);
+    }
     return true;
   }
 
   if (path === '/api/finance/add' && method === 'POST') {
     const body = await parseBody(req);
-    const expenses = loadJSON('expenses.json');
-    const expense = {
-      id: expenses.length + 1, vendor: body.vendor || 'Unknown',
-      amount: body.amount || 0, category: body.category || 'other',
-      date: new Date().toISOString().split('T')[0],
-    };
-    expenses.push(expense);
-    saveJSON('expenses.json', expenses);
-    json({ message: `Expense logged: ${expense.amount} at ${expense.vendor}`, expense });
+    try {
+      const fields = {
+        vendor: body.vendor || 'Unknown',
+        amount: parseFloat(body.amount) || 0,
+        date: new Date().toISOString().slice(0, 10),
+        category: body.category || 'misc',
+      };
+      if (body.notes) fields.notes = body.notes;
+
+      const data = await airtableFetch(`/${encodeURIComponent('Finance')}`, {
+        method: 'POST',
+        body: JSON.stringify({ records: [{ fields }], typecast: true }),
+      });
+      const e = data.records[0];
+      json({ message: `Expense logged: ${e.fields.amount} at ${e.fields.vendor}`, expense: e.fields });
+    } catch (err) {
+      json({ error: 'Failed to log expense', details: err.message }, 500);
+    }
     return true;
   }
 
   if (path === '/api/finance/spending' && method === 'GET') {
-    const expenses = loadJSON('expenses.json');
-    const total = expenses.reduce((s, e) => s + (e.amount || 0), 0);
-    const byCategory = {};
-    expenses.forEach(e => { byCategory[e.category] = (byCategory[e.category] || 0) + e.amount; });
-    json({ expenses: expenses.slice(-10), total, by_category: byCategory });
+    try {
+      const records = await listRecords('Finance', {
+        filterByFormula: "NOT({recurring} = TRUE())",
+      });
+      const expenses = records.map(r => ({
+        vendor: r.fields.vendor,
+        amount: r.fields.amount || 0,
+        category: r.fields.category || 'misc',
+        date: r.fields.date || null,
+      }));
+      const total = expenses.reduce((s, e) => s + e.amount, 0);
+      const byCategory = {};
+      expenses.forEach(e => { byCategory[e.category] = (byCategory[e.category] || 0) + e.amount; });
+      json({ expenses: expenses.slice(-10), total, by_category: byCategory });
+    } catch (err) {
+      json({ error: 'Failed to fetch spending', details: err.message }, 500);
+    }
     return true;
   }
+
+  // ============ WEATHER (unchanged) ============
 
   if (path === '/api/weather' && method === 'GET') {
     json(await getWeather());
     return true;
   }
 
+  // ============ BRIEFING (Airtable) ============
+
   if (path === '/api/briefing' && method === 'GET') {
-    const tasks = loadJSON('tasks.json').filter(t => t.status !== 'done').sort((a, b) => b.priority - a.priority).slice(0, 3);
-    const habits = loadJSON('habits.json');
-    const weather = await getWeather();
-    const bills = loadJSON('finance.json');
-    const today = new Date().getDate();
-    const upcoming = bills.filter(b => b.due_day >= today && b.due_day <= today + 7);
+    try {
+      const [taskRecords, habitRecords, billRecords] = await Promise.all([
+        listRecords('Tasks', {
+          filterByFormula: "NOT({status} = 'done')",
+          'sort[0][field]': 'priority',
+          'sort[0][direction]': 'desc',
+        }),
+        listRecords('Habits'),
+        listRecords('Finance', { filterByFormula: '{recurring} = TRUE()' }),
+      ]);
 
-    let calendar = 'not connected';
-    let email_stats = 'not connected';
-    if (isGoogleConfigured()) {
-      try {
-        const events = await getCalendarEvents();
-        calendar = events;
-      } catch (err) {
-        calendar = { error: 'Failed to fetch calendar', details: err.message };
+      const topTasks = taskRecords.slice(0, 3).map(r => `${r.fields.name} (priority ${r.fields.priority || 3})`);
+      const habits = habitRecords;
+      const doneCount = habits.filter(r => r.fields.completed).length;
+      const weather = await getWeather();
+      const upcoming = billRecords
+        .filter(r => r.fields.due_date)
+        .map(r => ({ vendor: r.fields.vendor, due_date: r.fields.due_date }));
+
+      let calendar = 'not connected';
+      let email_stats = 'not connected';
+      if (isGoogleConfigured()) {
+        try { calendar = await getCalendarEvents(); } catch (err) { calendar = { error: 'Failed', details: err.message }; }
+        try {
+          const stats = await getEmailStats();
+          email_stats = { unread_count: stats.unread_count, urgent_count: stats.urgent_count };
+        } catch (err) { email_stats = { error: 'Failed', details: err.message }; }
       }
-      try {
-        const stats = await getEmailStats();
-        email_stats = { unread_count: stats.unread_count, urgent_count: stats.urgent_count };
-      } catch (err) {
-        email_stats = { error: 'Failed to fetch email stats', details: err.message };
-      }
+
+      json({
+        top_tasks: topTasks,
+        habits: `${doneCount}/${habits.length} done`,
+        weather: weather.error ? 'unavailable' : `${weather.temperature}, ${weather.condition}`,
+        upcoming_bills: upcoming,
+        calendar,
+        email_stats,
+      });
+    } catch (err) {
+      json({ error: 'Briefing failed', details: err.message }, 500);
     }
-
-    json({
-      top_tasks: tasks.map(t => `${t.name} (priority ${t.priority})`),
-      habits: `${habits.filter(h => h.todayDone).length}/${habits.length} done`,
-      weather: weather.error ? 'unavailable' : `${weather.temperature}, ${weather.condition}`,
-      upcoming_bills: upcoming.map(b => `${b.vendor} due on the ${b.due_day}th`),
-      calendar,
-      email_stats,
-    });
     return true;
   }
+
+  // ============ GOOGLE CALENDAR & GMAIL (unchanged) ============
 
   if (path === '/api/calendar' && method === 'GET') {
     if (!isGoogleConfigured()) {
@@ -287,52 +397,17 @@ export async function handleAPIRequest(req, res) {
     const redirectUri = `https://${req.headers.host}/api/google/callback`;
     try {
       const tokens = await exchangeCodeForTokens(code, redirectUri);
-      const refreshToken = tokens.refresh_token || '(not returned \u2014 may already be stored)';
+      const refreshToken = tokens.refresh_token || '(not returned)';
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Google Connected \u2014 Atlas</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 24px; background: #0f172a; color: #e2e8f0; }
-    h1 { color: #34d399; }
-    .token-box { background: #1e293b; border: 1px solid #334155; border-radius: 8px; padding: 16px; word-break: break-all; font-family: monospace; font-size: 13px; margin: 16px 0; }
-    .step { margin: 12px 0; padding: 12px 16px; background: #1e293b; border-left: 3px solid #6366f1; border-radius: 4px; }
-  </style>
-</head>
-<body>
-  <h1>Google Connected!</h1>
-  <p>Atlas now has access to your Google Calendar and Gmail.</p>
-  <p><strong>Your refresh token:</strong></p>
-  <div class="token-box">${refreshToken}</div>
-  <p>Add this token to your Railway environment variables so Atlas remembers the connection after restarts:</p>
-  <div class="step">1. Go to your Railway project dashboard.</div>
-  <div class="step">2. Open <strong>Variables</strong> and add a new variable named <code>GOOGLE_REFRESH_TOKEN</code>.</div>
-  <div class="step">3. Paste the token above as the value and redeploy.</div>
-  <p>You can now close this tab.</p>
-</body>
-</html>`);
+      res.end(`<!DOCTYPE html><html><head><title>Google Connected</title></head><body><h1>Google Connected!</h1><p>Refresh token: <code>${refreshToken}</code></p><p>Add as GOOGLE_REFRESH_TOKEN in Railway and redeploy.</p></body></html>`);
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'text/html' });
-      res.end(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>OAuth Error \u2014 Atlas</title>
-  <style>body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 24px; background: #0f172a; color: #e2e8f0; } h1 { color: #f87171; }</style>
-</head>
-<body>
-  <h1>OAuth Error</h1>
-  <p>Failed to exchange code for tokens.</p>
-  <pre>${err.message}</pre>
-  <p>Try visiting <a href="/api/google/auth" style="color:#6366f1">/api/google/auth</a> again.</p>
-</body>
-</html>`);
+      res.end(`<h1>OAuth Error</h1><pre>${err.message}</pre>`);
     }
     return true;
   }
+
+  // ============ 404 ============
 
   json({ error: 'Not found', endpoints: ['/api/tasks', '/api/habits', '/api/finance/bills', '/api/finance/add', '/api/finance/spending', '/api/weather', '/api/briefing', '/api/calendar', '/api/emails', '/api/emails/stats', '/api/google/auth', '/api/google/callback'] }, 404);
   return true;
