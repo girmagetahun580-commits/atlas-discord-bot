@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Events } from 'discord.js';
+import { Client, GatewayIntentBits, Events, AttachmentBuilder } from 'discord.js';
 import {
   joinVoiceChannel, createAudioPlayer, createAudioResource,
   AudioPlayerStatus, EndBehaviorType, VoiceConnectionStatus, entersState,
@@ -23,6 +23,35 @@ const STATUS_CHANNEL = process.env.STATUS_CHANNEL_NAME || 'bot-status';
 // Discord voice message flag (1 << 13)
 const IS_VOICE_MESSAGE = 1 << 13;
 
+// --- Generate TTS audio as a Buffer (for voice note replies) ---
+
+async function generateVoiceReply(text) {
+  if (!ELEVENLABS_KEY) return null;
+  try {
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE}`,
+      {
+        method: 'POST',
+        headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_flash_v2_5',
+          voice_settings: { stability: 0.5, similarity_boost: 0.75, speed: 1.0 },
+          output_format: 'mp3_44100_128',
+        }),
+      }
+    );
+    if (!response.ok) {
+      console.log(`ElevenLabs TTS for voice reply failed: ${response.status}`);
+      return null;
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch (err) {
+    console.log(`Voice reply generation failed: ${err.message}`);
+    return null;
+  }
+}
+
 const discord = new Client({
   intents: [
     GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages,
@@ -33,12 +62,10 @@ const discord = new Client({
 // --- Transcribe Discord voice messages (OGG/Opus format) ---
 
 async function transcribeVoiceNote(audioUrl) {
-  // Download the audio file from Discord CDN
   const audioRes = await fetch(audioUrl);
   if (!audioRes.ok) throw new Error(`Failed to download voice note: ${audioRes.status}`);
   const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
 
-  // Send to Deepgram with OGG content type
   const response = await fetch(
     'https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&language=en',
     {
@@ -112,7 +139,6 @@ discord.on(Events.MessageCreate, async (message) => {
   try {
     await message.channel.sendTyping();
 
-    // Determine the user's message content
     let userText = message.content || '';
     let isVoiceNote = false;
 
@@ -133,7 +159,6 @@ discord.on(Events.MessageCreate, async (message) => {
         return;
       }
 
-      // Transcribe the voice message
       const transcript = await transcribeVoiceNote(audioAttachment.url);
       if (!transcript || transcript.trim().length === 0) {
         await message.reply("I couldn't make out what you said. Could you try again or type it out?");
@@ -142,13 +167,10 @@ discord.on(Events.MessageCreate, async (message) => {
 
       userText = transcript;
       console.log(`Transcribed voice note: "${transcript}"`);
-
-      // Show the transcription so user knows what Atlas heard
       await message.reply(`\ud83c\udfa4 *"${transcript}"*`);
       await message.channel.sendTyping();
     }
 
-    // If no text and no voice note, skip
     if (!userText.trim()) return;
 
     // Detect intent and fetch live data from Airtable
@@ -158,7 +180,6 @@ discord.on(Events.MessageCreate, async (message) => {
       dataContext = await fetchDataForIntents(intents, extractedParams);
     }
 
-    // Inject live data into the system prompt
     let systemPrompt = SYSTEM_PROMPT;
     if (dataContext) {
       systemPrompt += '\n\n' + dataContext + '\n\nUse the LIVE CONTEXT DATA above to answer the user accurately. Present the data conversationally \u2014 do not say "according to the data" or reference the data source. Just answer naturally as if you know this information.';
@@ -167,7 +188,18 @@ discord.on(Events.MessageCreate, async (message) => {
     const reply = await chatWithLLM(history, userText, systemPrompt);
     addMessage(message.channel.id, 'user', userText);
     addMessage(message.channel.id, 'assistant', reply);
-    if (reply.length > 2000) {
+
+    // If user sent a voice note, reply with voice + text
+    if (isVoiceNote && ELEVENLABS_KEY) {
+      const audioBuffer = await generateVoiceReply(reply);
+      if (audioBuffer) {
+        const attachment = new AttachmentBuilder(audioBuffer, { name: 'atlas-reply.mp3' });
+        const textContent = reply.length > 1900 ? reply.slice(0, 1900) + '\u2026' : reply;
+        await message.reply({ content: textContent, files: [attachment] });
+      } else {
+        await message.reply(reply);
+      }
+    } else if (reply.length > 2000) {
       const chunks = reply.match(/[\s\S]{1,1990}/g);
       for (const chunk of chunks) await message.reply(chunk);
     } else {
@@ -319,14 +351,14 @@ discord.once(Events.ClientReady, async (client) => {
   console.log(`   LLM: Groq (${GROQ_MODEL})`);
   console.log(`   Listening for text in #${TEXT_CHANNEL}`);
   console.log(`   Listening for voice in \ud83d\udd0a ${VOICE_CHANNEL}`);
-  console.log(`   Voice notes: enabled (Deepgram transcription)`);
+  console.log(`   Voice notes: enabled (Deepgram + ElevenLabs)`);
   console.log(`   Data: Airtable via local API middleware`);
   markOnline();
   try {
     const guild = client.guilds.cache.first();
     if (guild) {
       const statusCh = guild.channels.cache.find(c => c.name === STATUS_CHANNEL);
-      if (statusCh) await statusCh.send(`\u2705 **Atlas is online** (${new Date().toISOString()})\nLLM: Groq ${GROQ_MODEL}\nData: Airtable (unified sync)\nVoice notes: enabled`);
+      if (statusCh) await statusCh.send(`\u2705 **Atlas is online** (${new Date().toISOString()})\nLLM: Groq ${GROQ_MODEL}\nData: Airtable (unified sync)\nVoice notes: send \u2192 receive`);
     }
   } catch { }
 });
